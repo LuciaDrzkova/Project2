@@ -3,3 +3,4 @@
 .vscode/.cmake/
 *.user
 .DS_Store
+/build-core

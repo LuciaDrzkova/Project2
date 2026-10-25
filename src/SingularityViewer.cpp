@@ -67,6 +67,12 @@ void copyToBuffer(char* destination, std::size_t capacity, const char* text) {
 
 SingularityViewer::SingularityViewer()
     : pmp::MeshViewer("Singularity-aware Isosurface Explorer", 1480, 960, true) {
+    gridOverlay_ = std::make_shared<LineOverlay>(pmp::vec3(0.22, 0.38, 0.48), 1.0f);
+    originalWireOverlay_ = std::make_shared<LineOverlay>(pmp::vec3(1.0, 0.34, 0.08), 1.8f);
+    gridOverlay_->setEnabled(showGrid_);
+    originalWireOverlay_->setEnabled(false);
+    renderer_.add_overlay(gridOverlay_);
+    renderer_.add_overlay(originalWireOverlay_);
     set_scene(pmp::vec3(0.0, 0.0, 0.0), static_cast<float>(extent_ * 1.8));
     setStatus("Ready. The GUI is provided by PMP's viewer and Dear ImGui; Qt is not used.");
 }
@@ -121,15 +127,25 @@ void SingularityViewer::process_imgui() {
         ImGui::Checkbox("Extract F + kG", &usePerturbation_);
         ImGui::InputText("G(x,y,z)", perturbationText_, sizeof(perturbationText_));
         ImGui::InputDouble("k", &k_, 0.001, 0.01, "%.8g");
-        ImGui::TextWrapped("A nonzero k can remove a singularity or change topology. It is an experiment, not a guaranteed correction.");
+        ImGui::TextWrapped("A nonzero k can remove a singularity or change topology. A small k may produce a feature smaller than one grid cell.");
+        ImGui::TextWrapped("The displayed surface changes only after you click Extract / update mesh.");
+        if (std::string(functionText_) == "x^2+y^2-z^2" && std::string(perturbationText_) == "-x") {
+            const double cellWidth = (2.0 * extent_) / static_cast<double>(std::max(1, cells_));
+            ImGui::TextWrapped("For this cone with G=-x, the perturbed waist radius is |k|/2 = %.6g; current grid step is h = %.6g. If the radius is much smaller than h, Marching Cubes cannot reliably resolve the visible difference.", std::abs(k_) * 0.5, cellWidth);
+        }
+        if (ImGui::Checkbox("Overlay original F as orange wireframe", &showOriginalWireframe_)) {
+            originalWireOverlay_->setEnabled(showOriginalWireframe_ && meshWasExtractedWithPerturbation_);
+        }
 
         ImGui::Separator();
         ImGui::TextUnformatted("Extraction and resolution");
-        ImGui::Checkbox("Automatic resolution (coarse-to-fine convergence)", &automaticResolution_);
+        ImGui::Checkbox("Automatic resolution (geometry + topology heuristic)", &automaticResolution_);
         ImGui::InputInt("Grid cells per axis", &cells_);
         cells_ = std::clamp(cells_, 8, 180);
         ImGui::InputDouble("Normalized convergence tolerance", &convergenceTolerance_, 0.0005, 0.001, "%.6f");
         convergenceTolerance_ = std::clamp(convergenceTolerance_, 0.00001, 0.1);
+        if (ImGui::Checkbox("Show 3D sampling grid", &showGrid_)) gridOverlay_->setEnabled(showGrid_);
+        ImGui::TextWrapped("Grid lines show the uniform cubic sampling lattice used by Marching Cubes; they update on the next extraction.");
         if (ImGui::Button("Extract / update mesh")) extractCurrent();
         ImGui::SameLine();
         if (ImGui::Button("Find singularities on original F")) detectSingularities();
@@ -175,7 +191,7 @@ void SingularityViewer::process_imgui() {
             ImGui::TableSetupColumn("Vertices");
             ImGui::TableSetupColumn("Triangles");
             ImGui::TableSetupColumn("Components");
-            ImGui::TableSetupColumn("Normalized deviation");
+            ImGui::TableSetupColumn("Norm. symmetric RMS distance");
             ImGui::TableHeadersRow();
             for (const auto& row : kRows_) {
                 ImGui::TableNextRow();
@@ -183,10 +199,11 @@ void SingularityViewer::process_imgui() {
                 ImGui::TableNextColumn(); ImGui::Text("%llu", static_cast<unsigned long long>(row.vertices));
                 ImGui::TableNextColumn(); ImGui::Text("%llu", static_cast<unsigned long long>(row.triangles));
                 ImGui::TableNextColumn(); ImGui::Text("%llu", static_cast<unsigned long long>(row.components));
-                ImGui::TableNextColumn(); ImGui::Text("%.6g", row.normalizedDeviation);
+                ImGui::TableNextColumn(); ImGui::Text("%.6g", row.normalizedRmsDistance);
             }
             ImGui::EndTable();
         }
+        ImGui::TextWrapped("k-sweep rule: test equally spaced nonzero k values and choose the one with the lowest sampled symmetric RMS mesh distance to F=0, normalized by the domain-cube diagonal. This usually favors k values closest to zero; it does not enforce regularity or topology preservation.");
         ImGui::TextWrapped("Research limitation: this is a classic Marching Cubes baseline with numerical singularity candidates. It does not yet certify local topology or implement a proven singularity-aware patch.");
     }
     ImGui::End();
@@ -208,6 +225,9 @@ void SingularityViewer::extractCurrent() {
             throw std::runtime_error("No isosurface was found in this domain. Try a larger domain or a different polynomial.");
         }
         currentMesh_ = std::move(result);
+        currentActiveField_ = active;
+        currentFieldDescription_ = activeDescription(functionText_, usePerturbation_, perturbationText_, k_);
+        meshWasExtractedWithPerturbation_ = usePerturbation_;
         singularities_ = findSingularityCandidates(active, extent_).points;
         rebuildViewerMesh();
         updateMetrics(active, "Extraction finished in " + formatNumber(seconds, 4) + " seconds.");
@@ -219,43 +239,65 @@ void SingularityViewer::extractCurrent() {
 void SingularityViewer::selectAutomaticResolution() {
     try {
         const Polynomial active = activePolynomialFromUi();
-        const double diameter = 2.0 * extent_ * std::sqrt(3.0);
+        const double domainDiagonal = 2.0 * extent_ * std::sqrt(3.0);
         const std::vector<int> candidates{16, 32, 64, 128};
         Mesh previous;
-        Mesh latest;
-        int selected = 0;
+        Mesh selectedMesh;
+        int selectedCells = 0;
         bool converged = false;
+        bool topologyStable = false;
         double measuredChange = std::numeric_limits<double>::quiet_NaN();
         const auto start = std::chrono::steady_clock::now();
 
         for (const int n : candidates) {
             setStatus("Automatic resolution search: extracting " + std::to_string(n) + " cells per axis...");
-            latest = extractMarchingCubes(active, {n, extent_});
-            if (latest.empty()) continue;
-            selected = n;
+            Mesh candidate = extractMarchingCubes(active, {n, extent_});
+            if (candidate.empty()) continue;
+
+            selectedCells = n;
+            selectedMesh = candidate;
             if (!previous.empty()) {
-                measuredChange = approximateSymmetricMeshDistance(latest, previous) / diameter;
-                if (std::isfinite(measuredChange) && measuredChange <= convergenceTolerance_) {
+                measuredChange = approximateSymmetricMeshDistance(candidate, previous) / domainDiagonal;
+                const MeshMetrics previousMetrics = computeMeshMetrics(previous);
+                const MeshMetrics candidateMetrics = computeMeshMetrics(candidate);
+                topologyStable =
+                    previousMetrics.connectedComponents == candidateMetrics.connectedComponents &&
+                    previousMetrics.eulerCharacteristic == candidateMetrics.eulerCharacteristic &&
+                    previousMetrics.boundaryEdges == candidateMetrics.boundaryEdges &&
+                    previousMetrics.nonManifoldEdges == candidateMetrics.nonManifoldEdges;
+                if (std::isfinite(measuredChange) && measuredChange <= convergenceTolerance_ && topologyStable) {
                     converged = true;
+                    selectedMesh = std::move(candidate);
                     break;
                 }
             }
-            previous = latest;
+            previous = std::move(candidate);
         }
-        if (latest.empty()) {
+        if (selectedMesh.empty()) {
             throw std::runtime_error("No isosurface was found at any tested resolution in this domain.");
         }
-        currentMesh_ = std::move(latest);
-        cells_ = selected;
+
+        currentMesh_ = std::move(selectedMesh);
+        cells_ = selectedCells;
+        currentActiveField_ = active;
+        currentFieldDescription_ = activeDescription(functionText_, usePerturbation_, perturbationText_, k_);
+        meshWasExtractedWithPerturbation_ = usePerturbation_;
         singularities_ = findSingularityCandidates(active, extent_).points;
         rebuildViewerMesh();
         const auto end = std::chrono::steady_clock::now();
         const double seconds = std::chrono::duration<double>(end - start).count();
         std::string note;
         if (converged) {
-            note = "Convergence heuristic passed at " + std::to_string(selected) + " cells per axis; normalized mesh change=" + formatNumber(measuredChange) + ". Runtime=" + formatNumber(seconds, 4) + " s.";
+            note = "Convergence heuristic passed at " + std::to_string(selectedCells) +
+                " cells per axis; normalized sampled symmetric RMS distance=" + formatNumber(measuredChange) +
+                "; topology signature stable (components, Euler characteristic, boundary/non-manifold edges). Runtime=" +
+                formatNumber(seconds, 4) + " s.";
         } else {
-            note = "Maximum tested resolution (" + std::to_string(selected) + ") reached without satisfying tolerance. This is not a correctness guarantee. Runtime=" + formatNumber(seconds, 4) + " s.";
+            note = "Maximum non-empty tested resolution (" + std::to_string(selectedCells) +
+                ") reached without satisfying both geometry tolerance and topology-signature stability. Last normalized sampled symmetric RMS distance=" +
+                formatNumber(measuredChange) + "; topology signature stable at last comparison=" +
+                (topologyStable ? "yes" : "no") + ". This remains a heuristic, not a correctness guarantee. Runtime=" +
+                formatNumber(seconds, 4) + " s.";
         }
         updateMetrics(active, note);
     } catch (const std::exception& e) {
@@ -279,7 +321,7 @@ void SingularityViewer::detectSingularities() {
                 << ", Hessian: " << s.classification << '\n';
         }
         status_ = out.str();
-        if (!currentMesh_.empty()) updateMetrics(usePerturbation_ ? activePolynomialFromUi() : original, status_);
+        if (!currentMesh_.empty()) updateMetrics(currentActiveField_, status_);
     } catch (const std::exception& e) {
         setStatus(std::string("Singularity search failed: ") + e.what());
     }
@@ -308,7 +350,7 @@ void SingularityViewer::runKSweep() {
             const Polynomial candidateField = base + g * candidateK;
             const Mesh candidateMesh = extractMarchingCubes(candidateField, grid);
             if (candidateMesh.empty()) continue;
-            const MeshMetrics metrics = computeMeshMetrics(candidateMesh, &base);
+            const MeshMetrics metrics = computeMeshMetrics(candidateMesh);
             const double deviation = approximateSymmetricMeshDistance(candidateMesh, reference) / diameter;
             kRows_.push_back({candidateK, metrics.vertices, metrics.triangles, metrics.connectedComponents, deviation});
             if (std::isfinite(deviation) && deviation < bestDeviation) {
@@ -322,9 +364,12 @@ void SingularityViewer::runKSweep() {
         k_ = bestK;
         const Polynomial selectedField = base + g * bestK;
         currentMesh_ = extractMarchingCubes(selectedField, grid);
+        currentActiveField_ = selectedField;
+        currentFieldDescription_ = activeDescription(functionText_, true, perturbationText_, k_);
+        meshWasExtractedWithPerturbation_ = true;
         singularities_ = findSingularityCandidates(selectedField, extent_).points;
         rebuildViewerMesh();
-        updateMetrics(selectedField, "k sweep complete. Lowest sampled normalized mesh deviation among nonzero candidates: k=" + formatNumber(bestK, 8) + ", deviation=" + formatNumber(bestDeviation) + ". This ranking does not prove singularity or topology preservation.");
+        updateMetrics(selectedField, "k sweep complete. Selected the tested nonzero k with the lowest sampled normalized symmetric RMS mesh distance: k=" + formatNumber(bestK, 8) + ", distance=" + formatNumber(bestDeviation) + ". This objective favors closeness to the original geometry and does not prove regularity or topology preservation.");
     } catch (const std::exception& e) {
         setStatus(std::string("k sweep failed: ") + e.what());
     }
@@ -353,10 +398,10 @@ void SingularityViewer::exportSweepCsv() {
         if (kRows_.empty()) throw std::runtime_error("Run a k sweep before exporting its table.");
         std::ofstream out(csvExportPath_);
         if (!out) throw std::runtime_error("Could not open the requested CSV file for writing.");
-        out << "k,vertices,triangles,connected_components,normalized_mesh_deviation_to_original\n";
+        out << "k,vertices,triangles,connected_components,normalized_symmetric_rms_mesh_distance_to_original\n";
         out << std::setprecision(17);
         for (const auto& row : kRows_) {
-            out << row.k << ',' << row.vertices << ',' << row.triangles << ',' << row.components << ',' << row.normalizedDeviation << '\n';
+            out << row.k << ',' << row.vertices << ',' << row.triangles << ',' << row.components << ',' << row.normalizedRmsDistance << '\n';
         }
         if (!out) throw std::runtime_error("An error occurred while writing the CSV file.");
         setStatus("k sweep exported to: " + std::string(csvExportPath_));
@@ -366,27 +411,77 @@ void SingularityViewer::exportSweepCsv() {
 }
 
 void SingularityViewer::rebuildViewerMesh() {
-    // PMP's SurfaceMesh is manifold-oriented. The display copy deliberately
-    // duplicates each triangle's vertices so even a singular/non-manifold
-    // triangle soup can be displayed without altering currentMesh_ or its metrics.
     mesh_.clear();
-    for (const auto& triangle : currentMesh_.triangles) {
-        if (triangle[0] >= currentMesh_.vertices.size() ||
-            triangle[1] >= currentMesh_.vertices.size() ||
-            triangle[2] >= currentMesh_.vertices.size()) continue;
-        const auto& p0 = currentMesh_.vertices[triangle[0]];
-        const auto& p1 = currentMesh_.vertices[triangle[1]];
-        const auto& p2 = currentMesh_.vertices[triangle[2]];
-        const pmp::Vertex v0 = mesh_.add_vertex(pmp::Point(p0.x, p0.y, p0.z));
-        const pmp::Vertex v1 = mesh_.add_vertex(pmp::Point(p1.x, p1.y, p1.z));
-        const pmp::Vertex v2 = mesh_.add_vertex(pmp::Point(p2.x, p2.y, p2.z));
-        try {
-            mesh_.add_triangle(v0, v1, v2);
-        } catch (const std::exception&) {
-            // The raw triangle list remains authoritative; skip a face only in
-            // the PMP display copy if PMP refuses a degenerate triangle.
-        }
+    rejectedDisplayFaces_ = 0;
+    bool sharedIndexedRepresentation = true;
+    std::vector<pmp::Vertex> vertices;
+    vertices.reserve(currentMesh_.vertices.size());
+    for (const auto& point : currentMesh_.vertices) {
+        vertices.push_back(mesh_.add_vertex(pmp::Point(point.x, point.y, point.z)));
     }
+
+    // First try a proper indexed SurfaceMesh. When the extracted triangle list
+    // is manifold-compatible, PMP and the extractor now share the same V/E/F
+    // connectivity and their statistics agree.
+    try {
+        for (const auto& triangle : currentMesh_.triangles) {
+            if (triangle[0] >= vertices.size() || triangle[1] >= vertices.size() || triangle[2] >= vertices.size()) {
+                sharedIndexedRepresentation = false;
+                break;
+            }
+            const pmp::Face face = mesh_.add_triangle(vertices[triangle[0]], vertices[triangle[1]], vertices[triangle[2]]);
+            if (!face.is_valid()) {
+                sharedIndexedRepresentation = false;
+                break;
+            }
+        }
+    } catch (const std::exception&) {
+        sharedIndexedRepresentation = false;
+    }
+
+    if (!sharedIndexedRepresentation) {
+        // A manifold-oriented SurfaceMesh cannot encode every singular or
+        // non-manifold triangle soup. Clear the partial attempt and make a
+        // display-only mesh with one independent triangle per face. The source
+        // isa::Mesh remains untouched and is still the research/export source.
+        mesh_.clear();
+        rejectedDisplayFaces_ = 0;
+        for (const auto& triangle : currentMesh_.triangles) {
+            if (triangle[0] >= currentMesh_.vertices.size() ||
+                triangle[1] >= currentMesh_.vertices.size() ||
+                triangle[2] >= currentMesh_.vertices.size()) {
+                ++rejectedDisplayFaces_;
+                continue;
+            }
+            const auto& p0 = currentMesh_.vertices[triangle[0]];
+            const auto& p1 = currentMesh_.vertices[triangle[1]];
+            const auto& p2 = currentMesh_.vertices[triangle[2]];
+            const pmp::Vertex v0 = mesh_.add_vertex(pmp::Point(p0.x, p0.y, p0.z));
+            const pmp::Vertex v1 = mesh_.add_vertex(pmp::Point(p1.x, p1.y, p1.z));
+            const pmp::Vertex v2 = mesh_.add_vertex(pmp::Point(p2.x, p2.y, p2.z));
+            try {
+                const pmp::Face face = mesh_.add_triangle(v0, v1, v2);
+                if (!face.is_valid()) ++rejectedDisplayFaces_;
+            } catch (const std::exception&) {
+                ++rejectedDisplayFaces_;
+            }
+        }
+        viewerRepresentation_ = "triangle-soup display fallback (PMP duplicates triangle corners; topology counts intentionally differ)";
+    } else {
+        viewerRepresentation_ = "shared indexed PMP SurfaceMesh (source and viewer V/E/F should agree)";
+    }
+
+    gridOverlay_->setGrid(cells_, extent_);
+    gridOverlay_->setEnabled(showGrid_);
+    if (meshWasExtractedWithPerturbation_) {
+        const Mesh originalMesh = extractMarchingCubes(basePolynomialFromUi(), gridFromUi());
+        originalWireOverlay_->setMeshEdges(originalMesh);
+        originalWireOverlay_->setEnabled(showOriginalWireframe_);
+    } else {
+        originalWireOverlay_->clear();
+        originalWireOverlay_->setEnabled(false);
+    }
+
     update_mesh();
     if (!currentMesh_.empty()) {
         set_scene(pmp::vec3(0.0, 0.0, 0.0), static_cast<float>(extent_ * 1.8));
@@ -397,13 +492,21 @@ void SingularityViewer::rebuildViewerMesh() {
 void SingularityViewer::updateMetrics(const Polynomial& activeField, const std::string& note) {
     const MeshMetrics m = computeMeshMetrics(currentMesh_, &activeField);
     std::ostringstream out;
-    out << "Active field: " << activeDescription(functionText_, usePerturbation_, perturbationText_, k_) << '\n'
+    out << "Active field used for the displayed mesh: " << currentFieldDescription_ << '\n'
         << "Grid: " << cells_ << " cells per axis; domain [-" << extent_ << ", " << extent_ << "]^3\n"
-        << "Vertices: " << m.vertices << " | Triangles: " << m.triangles << " | Edges: " << m.edges << '\n'
-        << "Components: " << m.connectedComponents << " | Euler characteristic: " << m.eulerCharacteristic << '\n'
+        << "\nExtractor triangle-list statistics: vertices=" << m.vertices << " | edges=" << m.edges
+        << " | faces/triangles=" << m.triangles << '\n'
+        << "PMP Mesh Info (actual viewer SurfaceMesh): vertices=" << mesh_.n_vertices()
+        << " | edges=" << mesh_.n_edges() << " | faces=" << mesh_.n_faces() << '\n'
+        << "PMP display representation: " << viewerRepresentation_ << '\n';
+    if (rejectedDisplayFaces_ > 0) {
+        out << "WARNING: PMP viewer could not represent " << rejectedDisplayFaces_
+            << " source triangles; raw OBJ retains the complete source triangle list.\n";
+    }
+    out << "Components: " << m.connectedComponents << " | Euler characteristic: " << m.eulerCharacteristic << '\n'
         << "Boundary edges: " << m.boundaryEdges << " | Non-manifold edges: " << m.nonManifoldEdges
         << " | Degenerate triangles: " << m.degenerateTriangles << '\n'
-        << "Approx. RMS first-order residual distance: " << formatNumber(m.implicitResidualRms)
+        << "Approx. RMS first-order residual distance to active field: " << formatNumber(m.implicitResidualRms)
         << " (samples=" << m.residualSamples << ", skipped near-critical=" << m.skippedNearCriticalSamples << ")\n"
         << "Numerical singularity candidates currently shown: " << singularities_.size() << '\n';
     if (!note.empty()) out << "\n" << note << '\n';

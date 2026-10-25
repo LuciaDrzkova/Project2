@@ -1,9 +1,11 @@
 #pragma once
 
 #include "isa/Mesh.h"
+#include "isa/LineOverlay.h"
 #include "isa/Singularity.h"
 #include <pmp/viewers/mesh_viewer.h>
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -14,7 +16,7 @@ struct KSweepRow {
     std::size_t vertices{0};
     std::size_t triangles{0};
     std::size_t components{0};
-    double normalizedDeviation{0.0};
+    double normalizedRmsDistance{0.0};
 };
 
 // A desktop application built on PMP's GLFW/OpenGL viewer and Dear ImGui.
@@ -43,8 +45,17 @@ private:
     double kMax_{0.02};
     bool usePerturbation_{false};
     bool automaticResolution_{false};
+    bool showGrid_{false};
+    bool showOriginalWireframe_{true};
+    bool meshWasExtractedWithPerturbation_{false};
 
+    std::shared_ptr<LineOverlay> gridOverlay_;
+    std::shared_ptr<LineOverlay> originalWireOverlay_;
+    std::string viewerRepresentation_ = "not built";
+    std::size_t rejectedDisplayFaces_{0};
     Mesh currentMesh_;
+    Polynomial currentActiveField_;
+    std::string currentFieldDescription_ = "No extracted field yet";
     std::vector<SingularityCandidate> singularities_;
     std::vector<KSweepRow> kRows_;
     std::string status_ = "Ready. Select a preset and extract the zero isosurface.";

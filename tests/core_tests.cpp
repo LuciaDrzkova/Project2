@@ -38,6 +38,18 @@ int main(){
         require(metrics.degenerateTriangles==0,"Sphere mesh should not contain degenerate triangles at this resolution");
         require(metrics.connectedComponents==1,"Sphere mesh should have one connected component");
         require(std::isfinite(metrics.implicitResidualRms)&&metrics.implicitResidualRms<0.05,"Sphere residual should be small at this resolution");
+        // Regression check for V/E/F counts on a mesh with shared indexed edges.
+        isa::Mesh tetra;
+        tetra.vertices = {{0,0,0}, {1,0,0}, {0,1,0}, {0,0,1}};
+        tetra.triangles = {{{0,2,1}}, {{0,1,3}}, {{1,2,3}}, {{2,0,3}}};
+        const auto tetraMetrics = isa::computeMeshMetrics(tetra);
+        require(tetraMetrics.vertices == 4, "Tetrahedron should have four indexed vertices");
+        require(tetraMetrics.edges == 6, "Tetrahedron should have six unique indexed edges");
+        require(tetraMetrics.triangles == 4, "Tetrahedron should have four faces");
+        require(tetraMetrics.boundaryEdges == 0 && tetraMetrics.nonManifoldEdges == 0,
+                "Closed tetrahedron should have no boundary or non-manifold edges");
+        require(tetraMetrics.eulerCharacteristic == 2, "Tetrahedron Euler characteristic should be two");
+
         const double same=isa::approximateSymmetricMeshDistance(mesh,mesh);
         close(same,0.0,1e-12,"Mesh distance to itself");
         const auto perturbed=isa::Polynomial::parse("x^2+y^2-z^2-0.02*x");

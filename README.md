@@ -15,7 +15,8 @@ A thesis-oriented C++20 prototype for experimenting with polynomial implicit sur
 - Analytic derivatives and Hessians from the internal polynomial representation.
 - Classic 256-case Marching Cubes over a uniform grid.
 - Grid-seeded Newton search for numerical candidates satisfying `F=0` and `grad(F)=0`, with basic Hessian diagnostics.
-- Manual grid resolution and an automatic coarse-to-fine mesh-convergence heuristic.
+- Manual grid resolution and an automatic coarse-to-fine heuristic requiring both geometric convergence and a stable basic topology signature.
+- Optional overlay of the uniform 3D sampling grid and an orange wireframe of the original F=0 surface for comparison with F+kG.
 - Manual perturbation `F + kG` and a k-sweep, with results table and CSV export.
 - Mesh diagnostics: vertices, edges, triangles, connected components, Euler characteristic, boundary/non-manifold edges, degenerate triangles and an approximate implicit residual-distance estimate.
 - PMP mesh export and raw OBJ export. Raw OBJ preserves the triangle list when PMP's manifold-oriented mesh connectivity is not appropriate for a singular/non-manifold result.
@@ -49,7 +50,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 ```
 
-By default, CMake fetches PMP 3.0.0 and enables PMP's own viewer component. The first configure therefore needs network access. No `CMAKE_PREFIX_PATH` for Qt should be supplied. If you already have a PMP source checkout (as in a PMP-template-style project), configure with `-DISA_PMP_SOURCE_DIR=external/pmp-library`; replace that path with the actual location of your checkout. The configured PMP source must contain and build its `pmp_viewers` target.
+By default, CMake fetches the PMP `main` branch and enables PMP's own viewer component. This project uses the newer `pmp_viewers` API; the released PMP `3.0.0` tag has the older `pmp_vis` / `pmp/visualization` API and is not compatible with this source version. The first configure therefore needs network access. No `CMAKE_PREFIX_PATH` for Qt should be supplied. If you already have a PMP source checkout (as in a PMP-template-style project), configure with `-DISA_PMP_SOURCE_DIR=external/pmp-library`; replace that path with the actual location of your checkout. The configured PMP source must contain and build its `pmp_viewers` target (use a compatible checkout of the PMP `main` branch, not the released `3.0.0` tag).
 
 Run the app from the project root with:
 
@@ -61,7 +62,7 @@ If the app binary is not at that path, look for `singularity_aware_isosurfaces` 
 
 ### If PMP is already installed as a CMake package
 
-The selected PMP package must expose both `pmp` and `pmp_viewers` targets. Configure with the path to the relevant package if needed:
+The selected PMP package must expose both `pmp` and `pmp_viewers` targets and provide headers under `pmp/viewers` (the released PMP `3.0.0` package uses the older `pmp_vis` / `pmp/visualization` API). Configure with the path to the relevant package if needed:
 
 ```sh
 cmake -S . -B build \
@@ -91,10 +92,11 @@ The core tests cover polynomial parsing and derivatives, known singularity candi
 2. Use the PMP trackball viewer to rotate and zoom into the cone apex.
 3. Click **Find singularities on original F**. The search should find a candidate close to `(0,0,0)`.
 4. Select **Sphere** and extract. The sphere should not have singularity candidates on its zero set.
-5. Enable **Extract F + kG**, keep `G=-x`, and change `k`. The app extracts `F + kG`, i.e. `x^2+y^2-z^2-kx` for that choice of `G`.
-6. Enable **Automatic resolution** to compare successive meshes at 16, 32, 64 and 128 cells per axis. The criterion is a sampled mesh-to-mesh convergence heuristic, not a proof of exact accuracy or correct topology.
-7. Run the k sweep and export the CSV. It chooses the tested nonzero k with the lowest sampled normalized mesh-to-mesh deviation from the original mesh. That does not imply topology preservation or a universal optimum.
-8. Prefer raw OBJ export for singular or non-manifold results; PMP's `SurfaceMesh` may reject faces where conventional manifold connectivity cannot represent the triangle list.
+5. Enable **Extract F + kG**, keep `G=-x`, and choose a nonzero `k`. Click **Extract / update mesh** to actually apply the changed field. With `F=x^2+y^2-z^2` and `G=-x`, the waist radius of the resulting one-sheet hyperboloid is `|k|/2`; at the default `k=0.02`, this is `0.01`, much smaller than the default grid step `h=0.09375`. For a visible comparison, increase |k| and/or the grid resolution.
+6. Enable **Overlay original F as orange wireframe** to compare the original zero set against the perturbed solid surface. Enable **Show 3D sampling grid** to inspect the uniform Marching Cubes lattice.
+7. Enable **Automatic resolution** to compare meshes at 16, 32, 64 and 128 cells per axis. The updated selector requires both sampled geometric convergence and a stable basic topology signature. This remains a heuristic, not proof of accuracy or correct topology.
+8. Run the k sweep and export the CSV. It tests equally spaced k values (excluding values effectively equal to zero) and chooses the nonzero candidate with the lowest sampled symmetric RMS mesh distance to the original F=0 mesh, divided by the domain cube diagonal. This objective tends to prefer the smallest |k| and does not enforce singularity removal or topology preservation.
+9. Prefer raw OBJ export for singular or non-manifold results; the PMP viewer attempts a shared indexed mesh first and uses a triangle-soup display fallback only when needed.
 
 ## Mathematical and numerical limitations
 
@@ -106,17 +108,21 @@ The extractor uses the classic lookup table and linearly interpolates zero cross
 
 The program launches Newton iterations for `grad(F)=0` from coarse-grid seeds and then verifies whether the critical point also lies on `F=0`. It can miss singularities, especially degenerate or non-isolated ones, and it does not constitute a symbolic solution or completeness proof. Hessian classification is a local diagnostic.
 
-### PMP viewer display is not the research mesh representation
+### PMP Mesh Info and extractor statistics use different representations when needed
 
-The application retains the generated triangle list in its own `isa::Mesh`. To make a triangle soup viewable even at singular/non-manifold locations, the display copy duplicates each triangle's vertices before sending it to PMP's manifold-oriented `SurfaceMesh`. This is a rendering adaptation; do not use the display copy for topology measurements. Metrics and exports use the original triangle list.
+The app first tries to build a shared-index PMP `SurfaceMesh`. If that succeeds, the PMP viewer V/E/F counts and the extracted triangle-list V/E/F counts should agree. For singular or non-manifold triangle soups that PMP cannot encode with shared manifold connectivity, the viewer falls back to a display-only mesh with duplicated triangle corners. In that fallback, PMP Mesh Info reports counts for the display copy (usually three vertices and three edges per face), while the extractor diagnostics report the original indexed triangle list used for topology measurements and raw OBJ export. These are different representations, not contradictory counts; the status labels them separately. Some faces rejected by the display fallback are reported explicitly.
+
+### The k-sweep distance is not a normal-angle deviation
+
+The table/CSV value called normalized symmetric RMS mesh distance samples up to 250 vertices from each mesh and measures each sampled point's closest Euclidean distance to up to 8,000 sampled triangles on the other mesh. The two directed RMS distances are combined as `sqrt((d(A,B)^2 + d(B,A)^2)/2)` and divided by the diagonal of the domain cube. It does not compare surface normals. The calculation is approximate because both vertices and target triangles are subsampled; it is useful for exploration but is not an exact Hausdorff distance or topology test.
 
 ### Geometric residual is approximate
 
 The app evaluates an estimate based on `|F(p)| / ||grad(F(p))||` at mesh vertices. This first-order estimate is not reliable arbitrarily close to singularities, where the gradient can be small. Use an independently validated reference surface and robust closest-point distances for final thesis claims.
 
-### Automatic resolution means convergence between sampled meshes
+### Automatic resolution means sampled geometric convergence plus a basic topology-stability check
 
-The selector tries 16, 32, 64 and 128 cells per axis. It compares sampled vertices/triangles from successive meshes, normalized by the bounding-box diagonal. This is a convergence heuristic—not a certified Hausdorff bound, not an error bound, and not proof of topology preservation. If no tested resolution satisfies the tolerance, the app reports that the limit was reached.
+The selector tries 16, 32, 64 and 128 cells per axis. It compares a sampled symmetric RMS point-to-triangle distance between successive meshes, normalized by the diagonal of the sampling cube, and also requires the same connected-component count, Euler characteristic, boundary-edge count and non-manifold-edge count between the two meshes. The mesh at the first resolution passing both checks is selected. If no tested resolution satisfies both checks, the finest non-empty tested mesh is retained and the status reports that the test did not pass. This remains a heuristic—not a certified Hausdorff bound, not an error bound, and not proof of topology preservation.
 
 ### A k sweep does not preserve singularities by itself
 
@@ -132,7 +138,8 @@ The prototype uses a symmetric cubic domain `[-L,L]^3`, the zero isovalue, and a
 - `src/MarchingCubes.cpp`: scalar-grid evaluation and classic Marching Cubes implementation.
 - `src/Singularity.cpp`: seeded Newton search and Hessian classification.
 - `src/Metrics.cpp`: mesh diagnostics and sampled mesh-to-mesh comparison.
-- `src/SingularityViewer.cpp`: PMP viewer, ImGui controls and experiment workflow.
+- `src/SingularityViewer.cpp`: PMP viewer, ImGui controls, statistics and experiment workflow.
+- `src/LineOverlay.cpp` / `include/isa/LineOverlay.h`: OpenGL overlays for the sampling grid and original-surface wireframe.
 - `src/PmpExport.cpp`: PMP conversion/export and raw OBJ export.
 - `tests/core_tests.cpp`: regression tests.
 - `docs/THESIS_ALGORITHM_NEXT_STEPS.md`: suggested mathematical extensions.

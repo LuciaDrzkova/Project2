@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(ISA_BUILD_APP "Build the PMP-native desktop application (no Qt)" ON)
-option(ISA_FETCH_PMP "Fetch the pinned PMP 3.0.0 dependency for the app" ON)
+option(ISA_FETCH_PMP "Fetch PMP main (needed for the pmp_viewers API used by this app)" ON)
 option(ISA_PMP_USE_DOUBLE "Set ON when the selected PMP build uses 64-bit scalar precision" OFF)
 option(ISA_BUILD_TESTS "Build mathematical core tests" ON)
 
@@ -26,8 +26,6 @@ endif()
 if(ISA_BUILD_APP)
     # PMP's own viewer uses GLFW + OpenGL + Dear ImGui. No Qt installation is needed.
     set(ISA_PMP_SOURCE_DIR "" CACHE PATH "Optional path to an existing PMP source checkout (for example external/pmp-library)")
-    message(STATUS "ISA_PMP_SOURCE_DIR = '${ISA_PMP_SOURCE_DIR}'")
-    message(STATUS "ISA_FETCH_PMP = ${ISA_FETCH_PMP}")  
     if(ISA_PMP_SOURCE_DIR)
         set(PMP_SCALAR_TYPE 64 CACHE STRING "Use double precision in PMP" FORCE)
         set(PMP_BUILD_VIEWERS ON CACHE BOOL "Build PMP's GLFW/ImGui viewers" FORCE)
@@ -63,12 +61,13 @@ if(ISA_BUILD_APP)
         message(FATAL_ERROR "PMP was not found. Set ISA_PMP_SOURCE_DIR, leave ISA_FETCH_PMP=ON, or install a compatible PMP package.")
     endif()
     if(NOT TARGET pmp_viewers)
-        message(FATAL_ERROR "The selected PMP build does not include pmp_viewers. Rebuild/install PMP with -DPMP_BUILD_VIEWERS=ON, or leave ISA_FETCH_PMP=ON so this project fetches a compatible PMP build.")
+        message(FATAL_ERROR "The selected PMP build does not include pmp_viewers. This application uses the newer PMP viewers API (PMP_BUILD_VIEWERS / pmp_viewers / pmp/viewers); the released 3.0.0 tag uses the older visualization API (PMP_BUILD_VIS / pmp_vis / pmp/visualization). Use PMP main or set ISA_PMP_SOURCE_DIR to a checkout of a compatible newer revision.")
     endif()
 
     add_executable(singularity_aware_isosurfaces
         src/main.cpp
         src/SingularityViewer.cpp
+        src/LineOverlay.cpp
         src/PmpExport.cpp
         include/isa/SingularityViewer.h)
     target_link_libraries(singularity_aware_isosurfaces PRIVATE isa_core pmp pmp_viewers)
