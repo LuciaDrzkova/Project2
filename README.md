@@ -18,6 +18,8 @@ A thesis-oriented C++20 prototype for experimenting with polynomial implicit sur
 - Manual grid resolution and an automatic coarse-to-fine heuristic requiring both geometric convergence and a stable basic topology signature.
 - Optional overlay of the uniform 3D sampling grid and an orange wireframe of the original F=0 surface for comparison with F+kG.
 - Manual perturbation `F + kG` and a k-sweep, with results table and CSV export.
+- Linear interpolation patch from the best negative and positive k-sweep candidates; original-mesh vertex correspondence is maintained by closest-point projection onto both perturbed surfaces.
+- Marching Cubes triangle winding is oriented toward increasing F using the analytic gradient, with a consistent fallback at near-singular triangles.
 - Mesh diagnostics: vertices, edges, triangles, connected components, Euler characteristic, boundary/non-manifold edges, degenerate triangles and an approximate implicit residual-distance estimate.
 - PMP mesh export and raw OBJ export. Raw OBJ preserves the triangle list when PMP's manifold-oriented mesh connectivity is not appropriate for a singular/non-manifold result.
 - Core regression tests independent of the graphical viewer.
@@ -156,3 +158,7 @@ The prototype uses a symmetric cubic domain `[-L,L]^3`, the zero isovalue, and a
 ## PMP acknowledgment
 
 If you use PMP in research, cite the Polygon Mesh Processing Library by Sieger and Botsch (2023), DOI: [10.5281/zenodo.10866532](https://doi.org/10.5281/zenodo.10866532), and follow the current [PMP installation guide](https://www.pmp-library.org/installation.html).
+
+### Linear patch endpoint behavior
+
+At alpha `0`, the linear-patch feature displays the exact negative-k mesh selected by the sweep; at alpha `1`, it displays the exact positive-k mesh. Intermediate alpha values use the original F mesh connectivity and closest-point projection to define vertex correspondence. Because the extracted +/-k meshes can have different triangulations or topology, intermediate values are an approximate geometric morph, not a topology-preserving guarantee.

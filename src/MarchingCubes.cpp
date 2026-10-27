@@ -49,6 +49,7 @@ Mesh extractMarchingCubes(const Polynomial& field,const GridSpec& grid,const std
         }
     }
     Mesh mesh;
+    const PolynomialModel gradientModel(field);
     // Reuse the vertex generated for each grid edge so adjacent cells share vertices.
     std::map<std::pair<size_t,size_t>,std::uint32_t> edgeVertices;
     for (int k=0;k<n;++k) {
@@ -91,7 +92,23 @@ Mesh extractMarchingCubes(const Polynomial& field,const GridSpec& grid,const std
                 const auto a=getEdgeVertex(row[static_cast<size_t>(t)]);
                 const auto b=getEdgeVertex(row[static_cast<size_t>(t+1)]);
                 const auto c=getEdgeVertex(row[static_cast<size_t>(t+2)]);
-                if (a!=b && b!=c && a!=c) mesh.triangles.push_back({a,b,c});
+                if (a!=b && b!=c && a!=c) {
+                    // The classic table's winding is opposite to the desired
+                    // convention for cubeCase bits defined by F < 0. Start by
+                    // reversing it, then use grad(F) to correct regular faces.
+                    std::array<std::uint32_t,3> triangle{a,c,b};
+                    const Vec3& pa = mesh.vertices[triangle[0]];
+                    const Vec3& pb = mesh.vertices[triangle[1]];
+                    const Vec3& pc = mesh.vertices[triangle[2]];
+                    const Vec3 faceNormal = cross(pb-pa, pc-pa);
+                    const Vec3 centroid = (pa+pb+pc)/3.0;
+                    const Vec3 gradient = gradientModel.gradient(centroid);
+                    const double orientation = dot(faceNormal, gradient);
+                    const double tolerance = 1e-12 * norm(faceNormal) * norm(gradient);
+                    if (std::isfinite(orientation) && orientation < -tolerance)
+                        std::swap(triangle[1], triangle[2]);
+                    mesh.triangles.push_back(triangle);
+                }
             }
         }
     }

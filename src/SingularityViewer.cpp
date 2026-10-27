@@ -2,6 +2,7 @@
 
 #include "isa/MarchingCubes.h"
 #include "isa/Metrics.h"
+#include "isa/InterpolatedPatch.h"
 #include "isa/PmpExport.h"
 #include "isa/Polynomial.h"
 
@@ -157,6 +158,9 @@ void SingularityViewer::process_imgui() {
         ImGui::InputInt("k sample count", &sampleCount_);
         sampleCount_ = std::clamp(sampleCount_, 3, 41);
         if (ImGui::Button("Run k sweep")) runKSweep();
+        ImGui::SliderFloat("Patch interpolation alpha (negative -> positive)", &patchAlpha_, 0.0f, 1.0f, "%.2f");
+        if (ImGui::Button("Build linear patch from best -k / +k")) createInterpolatedPatchFromSweep();
+        ImGui::TextWrapped("After a k sweep, the patch uses the lowest-deviation negative and positive candidates. Alpha 0/1 shows the exact selected -k/+k mesh. Intermediate alpha values project original-F vertices to both surfaces and blend them; this approximation can be imperfect if topology differs.");
 
         ImGui::Separator();
         ImGui::TextUnformatted("Exports (paths are relative to the app's working directory unless absolute)");
@@ -360,6 +364,10 @@ void SingularityViewer::runKSweep() {
             }
         }
         if (!hasBest) throw std::runtime_error("No nonzero k candidate produced a comparable mesh.");
+        kSweepFunction_ = functionText_;
+        kSweepG_ = perturbationText_;
+        kSweepCells_ = cells_;
+        kSweepExtent_ = extent_;
         usePerturbation_ = true;
         k_ = bestK;
         const Polynomial selectedField = base + g * bestK;
@@ -372,6 +380,52 @@ void SingularityViewer::runKSweep() {
         updateMetrics(selectedField, "k sweep complete. Selected the tested nonzero k with the lowest sampled normalized symmetric RMS mesh distance: k=" + formatNumber(bestK, 8) + ", distance=" + formatNumber(bestDeviation) + ". This objective favors closeness to the original geometry and does not prove regularity or topology preservation.");
     } catch (const std::exception& e) {
         setStatus(std::string("k sweep failed: ") + e.what());
+    }
+}
+
+void SingularityViewer::createInterpolatedPatchFromSweep() {
+    try {
+        if (kRows_.empty()) throw std::runtime_error("Run a k sweep first.");
+        if (std::string(functionText_) != kSweepFunction_ ||
+            std::string(perturbationText_) != kSweepG_ || cells_ != kSweepCells_ ||
+            std::abs(extent_ - kSweepExtent_) > 1e-12) {
+            throw std::runtime_error("F, G, grid resolution, or domain changed since the k sweep. Run the k sweep again before building the patch.");
+        }
+        const KSweepRow* bestNegative = nullptr;
+        const KSweepRow* bestPositive = nullptr;
+        for (const auto& row : kRows_) {
+            if (!std::isfinite(row.normalizedRmsDistance)) continue;
+            if (row.k < 0.0 && (!bestNegative || row.normalizedRmsDistance < bestNegative->normalizedRmsDistance))
+                bestNegative = &row;
+            if (row.k > 0.0 && (!bestPositive || row.normalizedRmsDistance < bestPositive->normalizedRmsDistance))
+                bestPositive = &row;
+        }
+        if (!bestNegative || !bestPositive) {
+            throw std::runtime_error("Run a k sweep whose range contains both negative and positive k values first.");
+        }
+
+        const Polynomial base = basePolynomialFromUi();
+        const Polynomial g = Polynomial::parse(std::string(perturbationText_));
+        const GridSpec grid = gridFromUi();
+        const Mesh reference = extractMarchingCubes(base, grid);
+        const Mesh negativeMesh = extractMarchingCubes(base + g * bestNegative->k, grid);
+        const Mesh positiveMesh = extractMarchingCubes(base + g * bestPositive->k, grid);
+        Mesh patch = makeLinearInterpolatedPatch(reference, negativeMesh, positiveMesh,
+                                                 static_cast<double>(patchAlpha_));
+        if (patch.empty()) throw std::runtime_error("The linear-interpolation patch is empty.");
+
+        currentMesh_ = std::move(patch);
+        currentActiveField_ = base;
+        currentFieldDescription_ = "Linear-interpolated patch between k=" + formatNumber(bestNegative->k, 8) +
+            " and k=" + formatNumber(bestPositive->k, 8) + " (alpha=" + formatNumber(patchAlpha_, 3) + ")";
+        meshWasExtractedWithPerturbation_ = true;
+        singularities_ = findSingularityCandidates(base, extent_).points;
+        rebuildViewerMesh();
+        updateMetrics(base, "Built linear-interpolation patch from k-=" + formatNumber(bestNegative->k, 8) +
+            " and k+=" + formatNumber(bestPositive->k, 8) + " at alpha=" + formatNumber(patchAlpha_, 3) +
+            ". Candidates were selected by the existing normalized mesh-distance criterion. The patch inherits original F connectivity; this is a geometric interpolant, not a topology guarantee.");
+    } catch (const std::exception& e) {
+        setStatus(std::string("Linear patch creation failed: ") + e.what());
     }
 }
 

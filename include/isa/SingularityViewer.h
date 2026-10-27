@@ -43,6 +43,11 @@ private:
     double k_{0.02};
     double kMin_{-0.02};
     double kMax_{0.02};
+    float patchAlpha_{0.5f};
+    std::string kSweepFunction_;
+    std::string kSweepG_;
+    int kSweepCells_{0};
+    double kSweepExtent_{0.0};
     bool usePerturbation_{false};
     bool automaticResolution_{false};
     bool showGrid_{false};
@@ -69,6 +74,7 @@ private:
     void selectAutomaticResolution();
     void detectSingularities();
     void runKSweep();
+    void createInterpolatedPatchFromSweep();
     void exportCurrentPmpMesh();
     void exportCurrentRawObj();
     void exportSweepCsv();

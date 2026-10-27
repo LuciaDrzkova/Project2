@@ -14,7 +14,8 @@ add_library(isa_core
     src/Polynomial.cpp
     src/MarchingCubes.cpp
     src/Singularity.cpp
-    src/Metrics.cpp)
+    src/Metrics.cpp
+    src/InterpolatedPatch.cpp)
 target_include_directories(isa_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(isa_core PUBLIC cxx_std_20)
 if(MSVC)
