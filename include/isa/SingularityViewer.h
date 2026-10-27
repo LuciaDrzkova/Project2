@@ -17,6 +17,9 @@ struct KSweepRow {
     std::size_t triangles{0};
     std::size_t components{0};
     double normalizedRmsDistance{0.0};
+    bool pairEvaluated{false};
+    bool patchAccepted{false};
+    std::string pairValidation{"not evaluated"};
 };
 
 // A desktop application built on PMP's GLFW/OpenGL viewer and Dear ImGui.

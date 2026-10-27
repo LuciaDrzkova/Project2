@@ -64,6 +64,110 @@ void copyToBuffer(char* destination, std::size_t capacity, const char* text) {
     destination[i] = '\0';
 }
 
+// The interpolation routine may reverse triangle winding after projecting
+// vertices. Connectivity is therefore compared without regard to winding.
+bool sameUnorientedConnectivity(const Mesh& reference, const Mesh& patch) {
+    if (reference.vertices.size() != patch.vertices.size() ||
+        reference.triangles.size() != patch.triangles.size()) return false;
+
+    auto canonicalTriangles = [](const Mesh& mesh) {
+        auto triangles = mesh.triangles;
+        for (auto& triangle : triangles) {
+            std::sort(triangle.begin(), triangle.end());
+        }
+        std::sort(triangles.begin(), triangles.end());
+        return triangles;
+    };
+    return canonicalTriangles(reference) == canonicalTriangles(patch);
+}
+
+// Dimensionless triangle shape quality: 1 for an equilateral triangle and 0
+// for a collapsed/collinear triangle. It does not reject valid small triangles
+// merely because their absolute area is below a fixed world-space threshold.
+double triangleShapeQuality(const Vec3& a, const Vec3& b, const Vec3& c) {
+    const double ab2 = norm2(b - a);
+    const double bc2 = norm2(c - b);
+    const double ca2 = norm2(a - c);
+    const double sumSquaredEdges = ab2 + bc2 + ca2;
+    if (!std::isfinite(sumSquaredEdges) || sumSquaredEdges <= 0.0) return 0.0;
+    const double twiceArea = norm(cross(b - a, c - a));
+    if (!std::isfinite(twiceArea)) return 0.0;
+    return (2.0 * std::sqrt(3.0) * twiceArea) / sumSquaredEdges;
+}
+
+// Checks that interpolation retains the reference vertex/triangle connectivity,
+// finite coordinates, and avoids newly collapsed triangles. It intentionally
+// does not require every patch normal to remain in the same hemisphere as its
+// reference normal: these are curved surfaces, so large normal rotations alone
+// are not proof of a fold. Nor does it reject non-manifold edges inherited from
+// the singular reference mesh; vertex motion cannot change edge incidence.
+bool validateIntermediatePatch(const Mesh& reference, const Mesh& patch, std::string& reason) {
+    if (reference.empty() || patch.empty()) {
+        reason = "empty reference or patch";
+        return false;
+    }
+    if (!sameUnorientedConnectivity(reference, patch)) {
+        reason = "patch vertex/triangle connectivity differs from reference (ignoring winding)";
+        return false;
+    }
+    for (const auto& p : patch.vertices) {
+        if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {
+            reason = "non-finite patch vertex";
+            return false;
+        }
+    }
+
+    // Compare each interpolated face with the matching reference face. If the
+    // reference face was already degenerate at the original singularity, do not
+    // reject the whole pair just because that pre-existing condition is present.
+    constexpr double kUsableReferenceQuality = 1e-8;
+    constexpr double kMinimumPatchQuality = 1e-10;
+    constexpr double kQualityDropRatio = 1e-5;
+    constexpr double kAreaCollapseRatio = 1e-10;
+    std::size_t newlyCollapsed = 0;
+    for (const auto& triangle : reference.triangles) {
+        const auto a = triangle[0], b = triangle[1], c = triangle[2];
+        if (a >= reference.vertices.size() || b >= reference.vertices.size() ||
+            c >= reference.vertices.size() || a >= patch.vertices.size() ||
+            b >= patch.vertices.size() || c >= patch.vertices.size()) {
+            reason = "triangle index out of range";
+            return false;
+        }
+        const Vec3 refCross = cross(reference.vertices[b] - reference.vertices[a],
+                                    reference.vertices[c] - reference.vertices[a]);
+        const Vec3 patchCross = cross(patch.vertices[b] - patch.vertices[a],
+                                      patch.vertices[c] - patch.vertices[a]);
+        const double refArea2 = norm(refCross);
+        const double patchArea2 = norm(patchCross);
+        const double refQuality = triangleShapeQuality(reference.vertices[a],
+                                                       reference.vertices[b],
+                                                       reference.vertices[c]);
+        const double patchQuality = triangleShapeQuality(patch.vertices[a],
+                                                         patch.vertices[b],
+                                                         patch.vertices[c]);
+        if (!std::isfinite(refArea2) || !std::isfinite(patchArea2) ||
+            !std::isfinite(refQuality) || !std::isfinite(patchQuality)) {
+            reason = "non-finite triangle geometry";
+            return false;
+        }
+
+        // Ignore triangles that were already ill-shaped in the reference mesh;
+        // this is important for an input zero-set containing a singularity.
+        if (refQuality >= kUsableReferenceQuality && refArea2 > 0.0) {
+            const bool shapeCollapsed = patchQuality < kMinimumPatchQuality ||
+                                        patchQuality < refQuality * kQualityDropRatio;
+            const bool areaCollapsed = patchArea2 < refArea2 * kAreaCollapseRatio;
+            if (shapeCollapsed || areaCollapsed) ++newlyCollapsed;
+        }
+    }
+    if (newlyCollapsed > 0) {
+        reason = std::to_string(newlyCollapsed) +
+                 " triangle(s) collapsed relative to the reference geometry";
+        return false;
+    }
+    reason = "passed connectivity, finite-coordinate, and scale-relative collapse checks at alpha=0.25, 0.50, 0.75";
+    return true;
+}
 } // namespace
 
 SingularityViewer::SingularityViewer()
@@ -160,7 +264,7 @@ void SingularityViewer::process_imgui() {
         if (ImGui::Button("Run k sweep")) runKSweep();
         ImGui::SliderFloat("Patch interpolation alpha (negative -> positive)", &patchAlpha_, 0.0f, 1.0f, "%.2f");
         if (ImGui::Button("Build linear patch from best -k / +k")) createInterpolatedPatchFromSweep();
-        ImGui::TextWrapped("After a k sweep, the patch uses the lowest-deviation negative and positive candidates. Alpha 0/1 shows the exact selected -k/+k mesh. Intermediate alpha values project original-F vertices to both surfaces and blend them; this approximation can be imperfect if topology differs.");
+        ImGui::TextWrapped("Patch selection tests symmetric (-k,+k) pairs together. It accepts only pairs whose interpolated patches pass finite-coordinate, degeneracy, non-manifold-edge, and orientation checks at alpha=0.25, 0.50, 0.75; among passing pairs it selects the lowest mean distance to F=0. These numerical checks are not a topology proof.");
 
         ImGui::Separator();
         ImGui::TextUnformatted("Exports (paths are relative to the app's working directory unless absolute)");
@@ -190,12 +294,14 @@ void SingularityViewer::process_imgui() {
             }
         }
 
-        if (!kRows_.empty() && ImGui::BeginTable("k sweep results", 5, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+        if (!kRows_.empty() && ImGui::BeginTable("k sweep results", 7, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
             ImGui::TableSetupColumn("k");
             ImGui::TableSetupColumn("Vertices");
             ImGui::TableSetupColumn("Triangles");
             ImGui::TableSetupColumn("Components");
             ImGui::TableSetupColumn("Norm. symmetric RMS distance");
+            ImGui::TableSetupColumn("Pair tested");
+            ImGui::TableSetupColumn("Patch valid");
             ImGui::TableHeadersRow();
             for (const auto& row : kRows_) {
                 ImGui::TableNextRow();
@@ -204,6 +310,8 @@ void SingularityViewer::process_imgui() {
                 ImGui::TableNextColumn(); ImGui::Text("%llu", static_cast<unsigned long long>(row.triangles));
                 ImGui::TableNextColumn(); ImGui::Text("%llu", static_cast<unsigned long long>(row.components));
                 ImGui::TableNextColumn(); ImGui::Text("%.6g", row.normalizedRmsDistance);
+                ImGui::TableNextColumn(); ImGui::TextUnformatted(row.pairEvaluated ? "yes" : "no");
+                ImGui::TableNextColumn(); ImGui::TextWrapped("%s", row.pairValidation.c_str());
             }
             ImGui::EndTable();
         }
@@ -391,44 +499,103 @@ void SingularityViewer::createInterpolatedPatchFromSweep() {
             std::abs(extent_ - kSweepExtent_) > 1e-12) {
             throw std::runtime_error("F, G, grid resolution, or domain changed since the k sweep. Run the k sweep again before building the patch.");
         }
-        const KSweepRow* bestNegative = nullptr;
-        const KSweepRow* bestPositive = nullptr;
-        for (const auto& row : kRows_) {
-            if (!std::isfinite(row.normalizedRmsDistance)) continue;
-            if (row.k < 0.0 && (!bestNegative || row.normalizedRmsDistance < bestNegative->normalizedRmsDistance))
-                bestNegative = &row;
-            if (row.k > 0.0 && (!bestPositive || row.normalizedRmsDistance < bestPositive->normalizedRmsDistance))
-                bestPositive = &row;
-        }
-        if (!bestNegative || !bestPositive) {
-            throw std::runtime_error("Run a k sweep whose range contains both negative and positive k values first.");
-        }
 
         const Polynomial base = basePolynomialFromUi();
         const Polynomial g = Polynomial::parse(std::string(perturbationText_));
         const GridSpec grid = gridFromUi();
         const Mesh reference = extractMarchingCubes(base, grid);
-        const Mesh negativeMesh = extractMarchingCubes(base + g * bestNegative->k, grid);
-        const Mesh positiveMesh = extractMarchingCubes(base + g * bestPositive->k, grid);
-        Mesh patch = makeLinearInterpolatedPatch(reference, negativeMesh, positiveMesh,
-                                                 static_cast<double>(patchAlpha_));
+        if (reference.empty()) throw std::runtime_error("The original F=0 reference mesh is empty.");
+
+        // Clear stale validation labels before testing this sweep.
+        for (auto& row : kRows_) {
+            row.pairEvaluated = false;
+            row.patchAccepted = false;
+            row.pairValidation = "not evaluated";
+        }
+
+        const KSweepRow* selectedNegative = nullptr;
+        const KSweepRow* selectedPositive = nullptr;
+        double bestPairScore = std::numeric_limits<double>::infinity();
+        std::string bestFailure = "No symmetric pair was present in the sweep.";
+        const double maxMagnitude = std::max(std::abs(kMin_), std::abs(kMax_));
+        const double kTolerance = std::max(1e-12, maxMagnitude * 1e-8);
+
+        for (auto& negative : kRows_) {
+            if (!(negative.k < 0.0) || !std::isfinite(negative.normalizedRmsDistance)) continue;
+            auto positiveIt = std::find_if(kRows_.begin(), kRows_.end(), [&](const KSweepRow& row) {
+                return row.k > 0.0 && std::abs(row.k + negative.k) <= kTolerance &&
+                       std::isfinite(row.normalizedRmsDistance);
+            });
+            if (positiveIt == kRows_.end()) continue;
+            KSweepRow& positive = *positiveIt;
+            negative.pairEvaluated = positive.pairEvaluated = true;
+
+            const Mesh negativeMesh = extractMarchingCubes(base + g * negative.k, grid);
+            const Mesh positiveMesh = extractMarchingCubes(base + g * positive.k, grid);
+            if (negativeMesh.empty() || positiveMesh.empty()) {
+                negative.pairValidation = positive.pairValidation = "rejected: one perturbed surface is empty";
+                bestFailure = negative.pairValidation;
+                continue;
+            }
+
+            bool valid = true;
+            std::string reason;
+            // Test multiple intermediate alpha values. Endpoints alone are not
+            // enough because the interpolated geometry can fold between them.
+            for (const double alpha : {0.25, 0.50, 0.75}) {
+                const Mesh patch = makeLinearInterpolatedPatch(reference, negativeMesh, positiveMesh, alpha);
+                if (!validateIntermediatePatch(reference, patch, reason)) {
+                    valid = false;
+                    reason = "rejected at alpha=" + formatNumber(alpha, 2) + ": " + reason;
+                    break;
+                }
+            }
+            if (!valid) {
+                negative.pairValidation = positive.pairValidation = reason;
+                bestFailure = reason;
+                continue;
+            }
+
+            negative.patchAccepted = positive.patchAccepted = true;
+            negative.pairValidation = positive.pairValidation = "accepted: " + reason;
+            const double score = 0.5 * (negative.normalizedRmsDistance + positive.normalizedRmsDistance);
+            if (score < bestPairScore) {
+                bestPairScore = score;
+                selectedNegative = &negative;
+                selectedPositive = &positive;
+            }
+        }
+
+        if (!selectedNegative || !selectedPositive) {
+            throw std::runtime_error("No symmetric k pair passed intermediate-patch validation. Last diagnostic: " + bestFailure +
+                                     ". Try a wider k range, a finer grid, or inspect the CSV validation column.");
+        }
+
+        Mesh patch = makeLinearInterpolatedPatch(reference,
+            extractMarchingCubes(base + g * selectedNegative->k, grid),
+            extractMarchingCubes(base + g * selectedPositive->k, grid),
+            static_cast<double>(patchAlpha_));
+        std::string finalReason;
+        if (patchAlpha_ > 0.0f && patchAlpha_ < 1.0f &&
+            !validateIntermediatePatch(reference, patch, finalReason)) {
+            throw std::runtime_error("The selected pair passed sampled alpha checks but the current alpha failed validation: " + finalReason);
+        }
         if (patch.empty()) throw std::runtime_error("The linear-interpolation patch is empty.");
 
         currentMesh_ = std::move(patch);
         currentActiveField_ = base;
-        currentFieldDescription_ = "Linear-interpolated patch between k=" + formatNumber(bestNegative->k, 8) +
-            " and k=" + formatNumber(bestPositive->k, 8) + " (alpha=" + formatNumber(patchAlpha_, 3) + ")";
+        currentFieldDescription_ = "Validated linear-interpolated patch between k=" + formatNumber(selectedNegative->k, 8) +
+            " and k=" + formatNumber(selectedPositive->k, 8) + " (alpha=" + formatNumber(patchAlpha_, 3) + ")";
         meshWasExtractedWithPerturbation_ = true;
         singularities_ = findSingularityCandidates(base, extent_).points;
         rebuildViewerMesh();
-        updateMetrics(base, "Built linear-interpolation patch from k-=" + formatNumber(bestNegative->k, 8) +
-            " and k+=" + formatNumber(bestPositive->k, 8) + " at alpha=" + formatNumber(patchAlpha_, 3) +
-            ". Candidates were selected by the existing normalized mesh-distance criterion. The patch inherits original F connectivity; this is a geometric interpolant, not a topology guarantee.");
+        updateMetrics(base, "Selected symmetric pair k-= " + formatNumber(selectedNegative->k, 8) +
+            ", k+= " + formatNumber(selectedPositive->k, 8) + "; mean normalized distance=" +
+            formatNumber(bestPairScore) + ". Patch passed winding-insensitive connectivity, finite-coordinate, and scale-relative triangle-collapse checks at alpha=0.25, 0.50, 0.75. These are numerical checks, not a mathematical topology guarantee.");
     } catch (const std::exception& e) {
         setStatus(std::string("Linear patch creation failed: ") + e.what());
     }
 }
-
 void SingularityViewer::exportCurrentPmpMesh() {
     try {
         exportWithPmp(currentMesh_, std::string(pmpExportPath_));
@@ -452,10 +619,15 @@ void SingularityViewer::exportSweepCsv() {
         if (kRows_.empty()) throw std::runtime_error("Run a k sweep before exporting its table.");
         std::ofstream out(csvExportPath_);
         if (!out) throw std::runtime_error("Could not open the requested CSV file for writing.");
-        out << "k,vertices,triangles,connected_components,normalized_symmetric_rms_mesh_distance_to_original\n";
+        out << "k,vertices,triangles,connected_components,normalized_symmetric_rms_mesh_distance_to_original,pair_evaluated,patch_accepted,pair_validation\n";
         out << std::setprecision(17);
         for (const auto& row : kRows_) {
-            out << row.k << ',' << row.vertices << ',' << row.triangles << ',' << row.components << ',' << row.normalizedRmsDistance << '\n';
+            std::string safeValidation = row.pairValidation;
+            std::replace(safeValidation.begin(), safeValidation.end(), ',', ';');
+            std::replace(safeValidation.begin(), safeValidation.end(), '\n', ' ');
+            out << row.k << ',' << row.vertices << ',' << row.triangles << ',' << row.components << ','
+                << row.normalizedRmsDistance << ',' << (row.pairEvaluated ? 1 : 0) << ','
+                << (row.patchAccepted ? 1 : 0) << ',' << safeValidation << '\n';
         }
         if (!out) throw std::runtime_error("An error occurred while writing the CSV file.");
         setStatus("k sweep exported to: " + std::string(csvExportPath_));
